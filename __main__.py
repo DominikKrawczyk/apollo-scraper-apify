@@ -86,16 +86,23 @@ async def main():
             
             # Try to load saved cookies from Apify Key-Value Store
             saved_cookies = None
-            try:
-                kvs = await Actor.open_key_value_store()
-                saved_cookies = await kvs.get_value('apollo_cookies')
-                if saved_cookies:
-                    log_message("✅ Found saved cookies in Key-Value Store", 'SUCCESS')
-                else:
-                    log_message("⚠️  No saved cookies found, will use password login", 'WARNING')
-            except Exception as e:
-                log_message(f"⚠️  Could not access Key-Value Store: {e}", 'WARNING')
-            
+            # First check input for cookies
+            input_cookies = actor_input.get('cookies')
+            if input_cookies:
+                saved_cookies = input_cookies
+                log_message("✅ Using cookies from actor input", 'SUCCESS')
+            else:
+                # Fall back to Key-Value Store
+                try:
+                    kvs = await Actor.open_key_value_store()
+                    saved_cookies = await kvs.get_value('apollo_cookies')
+                    if saved_cookies:
+                        log_message("✅ Found saved cookies in Key-Value Store", 'SUCCESS')
+                    else:
+                        log_message("⚠️  No saved cookies found, will use password login", 'WARNING')
+                except Exception as e:
+                    log_message(f"⚠️  Could not access Key-Value Store: {e}", 'WARNING')
+                    
             # Attempt login (will try cookies first if available)
             login_success = scraper.login(
                 email=apollo_email,
