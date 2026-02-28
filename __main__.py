@@ -45,24 +45,26 @@ async def main():
         
         # NOTE: Apollo.io detects Apify proxy - trying WITHOUT proxy first!
         # Get proxy URL if configured
-        proxy_url = None
-        use_proxy_option = False  # Force disable proxy for better success rate
+        # Get proxy URL - supports direct proxyUrl OR proxyConfiguration
+        proxy_url = actor_input.get('proxyUrl')
         
-        if proxy_config and use_proxy_option:  # Proxy disabled by default
+        if proxy_url:
+            log_message(f"✅ Using direct proxy: {proxy_url[:50]}...", 'INFO')
+        elif proxy_config:
             try:
-                from apify import ProxyConfiguration
-                # Create proxy configuration
-                if isinstance(proxy_config, dict) and proxy_config.get('useApifyProxy'):
-                    proxy_configuration = ProxyConfiguration()
-                else:
-                    proxy_configuration = ProxyConfiguration(**proxy_config) if isinstance(proxy_config, dict) else ProxyConfiguration()
-                proxy_url = await proxy_configuration.new_url()
-                log_message(f"Using proxy: {proxy_url[:50]}...")
+                proxy_urls = proxy_config.get('proxyUrls', [])
+                if proxy_urls and not proxy_config.get('useApifyProxy'):
+                    # Use first custom proxy URL directly
+                    proxy_url = proxy_urls[0]
+                    log_message(f"✅ Using custom proxy: {proxy_url[:50]}...", 'INFO')
+                elif proxy_config.get('useApifyProxy'):
+                    log_message("⚠️  Apify proxy skipped - Apollo blocks datacenter IPs", 'WARNING')
+                    proxy_url = None
             except Exception as e:
-                log_message(f"Proxy setup failed, continuing without proxy: {e}", 'WARNING')
+                log_message(f"Proxy setup failed: {e}", 'WARNING')
                 proxy_url = None
         else:
-            log_message("⚠️  Proxy DISABLED - Apollo.io blocks Apify proxy IPs", 'WARNING')
+            log_message("⚠️  No proxy configured - Apollo may block datacenter IPs", 'WARNING')
         
         # Initialize scraper
         scraper = None
