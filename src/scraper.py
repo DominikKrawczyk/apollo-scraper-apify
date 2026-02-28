@@ -103,14 +103,19 @@ class ApolloScraper:
         
         try:
             # Initialize undetected-chromedriver
-            # This automatically patches ChromeDriver to avoid detection
+        
+            # Auto-detect installed Chrome major version
+            import subprocess, re
+            _result = subprocess.run(['google-chrome', '--version'], capture_output=True, text=True)
+            _chrome_ver = int(re.search(r'(\d+)\.', _result.stdout).group(1))
+            log_message(f"🔍 Detected Chrome version: {_chrome_ver}", 'INFO')
+
             self.driver = uc.Chrome(
                 options=options,
                 use_subprocess=True,  # Better for avoiding detection
-                version_main=None,  # Auto-detect Chrome version
+                version_main=_chrome_ver,  # Match installed Chrome version
                 driver_executable_path=None,  # Let uc find it
             )
-            
             # Set page load timeout
             self.driver.set_page_load_timeout(Config.PAGE_LOAD_TIMEOUT)
             
@@ -738,3 +743,4 @@ class ApolloScraper:
     def __exit__(self, exc_type, exc_val, exc_tb):
         """Context manager exit"""
         self.close()
+
