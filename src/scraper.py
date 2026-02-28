@@ -265,13 +265,20 @@ class ApolloScraper:
             return None
     
     # =========================================================================
-    # FIX #1: Complete rewrite of load_cookies with proper domain handling
+    # FIX #1: Cookie injection via Chrome DevTools Protocol (CDP)
+    # 
+    # driver.add_cookie() uses ChromeDriver's strict validation which
+    # rejects cookies for various reasons (domain mismatch, sameSite, etc.)
+    # even when the cookies are perfectly valid.
+    #
+    # CDP's Network.setCookie bypasses ALL of ChromeDriver's validation
+    # and injects cookies directly into Chrome's cookie store.
+    # This is the same mechanism Chrome's own DevTools uses.
     # =========================================================================
     def load_cookies(self, cookies: List[Dict] = None, filename: str = '/tmp/apollo_cookies.json'):
-        """Load cookies from file or list"""
+        """Load cookies from file or list using CDP (bypasses ChromeDriver bugs)"""
         try:
             if not cookies:
-                # Try to load from file
                 try:
                     with open(filename, 'r') as f:
                         cookies = json.load(f)
@@ -281,101 +288,77 @@ class ApolloScraper:
                     return False
             
             if cookies:
-                # =====================================================
-                # STEP 1: Navigate to Apollo domain FIRST
-                # Selenium REQUIRES the browser to be on the same domain
-                # before you can add cookies for that domain.
-                # =====================================================
+                # STEP 1: Navigate to Apollo domain first
                 self.driver.get("https://app.apollo.io")
                 random_delay(2, 4)
                 
-                # DEBUG: Log where we actually landed
                 current_url = self.driver.current_url
                 log_message(f"🔍 Browser landed on: {current_url}", 'INFO')
                 
-                # If we got redirected away from apollo.io, try again
-                if 'apollo.io' not in current_url:
-                    log_message("⚠️  Redirected away from Apollo! Retrying...", 'WARNING')
-                    self.driver.get("https://app.apollo.io/#/login")
-                    random_delay(3, 5)
-                    current_url = self.driver.current_url
-                    log_message(f"🔍 Browser now on: {current_url}", 'INFO')
-                
-                # =====================================================
-                # STEP 2: Inject cookies with proper sanitization
-                # Selenium only accepts: name, value, domain, path, 
-                # expiry, secure, httpOnly
-                # Browser extensions export extra fields that MUST be
-                # stripped: sameSite, storeId, hostOnly, session, id,
-                # expirationDate, etc.
-                # =====================================================
-                ALLOWED_KEYS = {'name', 'value', 'domain', 'path', 'expiry', 'secure', 'httpOnly'}
+                # STEP 2: Inject cookies via CDP — the nuclear option
+                # CDP Network.setCookie has NO validation restrictions
                 added = 0
                 failed = 0
                 
                 for cookie in cookies:
                     try:
-                        # Build a clean cookie dict with only allowed fields
-                        clean = {}
-                        for k, v in cookie.items():
-                            if k in ALLOWED_KEYS:
-                                clean[k] = v
+                        name = cookie.get('name', '')
+                        value = cookie.get('value', '')
                         
-                        # Handle expirationDate -> expiry (EditThisCookie format)
-                        if 'expiry' not in clean and 'expirationDate' in cookie:
-                            try:
-                                clean['expiry'] = int(cookie['expirationDate'])
-                            except (ValueError, TypeError):
-                                pass  # Session cookie, no expiry needed
-                        
-                        # Fix expiry type (must be int)
-                        if 'expiry' in clean:
-                            try:
-                                clean['expiry'] = int(clean['expiry'])
-                            except (ValueError, TypeError):
-                                del clean['expiry']
-                        
-                        # Must have name and value
-                        if 'name' not in clean or 'value' not in clean:
+                        if not name or not value:
                             failed += 1
                             continue
                         
-                        # =====================================================
-                        # FIX: Domain handling - the ROOT CAUSE of failures
-                        # 
-                        # Cookies exported from browser have domain like:
-                        #   ".apollo.io"  or  "app.apollo.io"  or  ".app.apollo.io"
-                        # 
-                        # ChromeDriver is STRICT: the cookie domain must be a
-                        # valid match for the current page domain.
-                        #
-                        # Strategy: Force domain to "app.apollo.io" for all
-                        # Apollo cookies since that's where we navigated to.
-                        # Skip non-Apollo cookies entirely.
-                        # =====================================================
-                        cookie_domain = clean.get('domain', '')
+                        # Get domain from cookie, default to .apollo.io
+                        domain = cookie.get('domain', '.apollo.io')
                         
-                        # Skip cookies that aren't for Apollo at all
-                        if cookie_domain and 'apollo.io' not in cookie_domain:
+                        # Build CDP cookie parameters
+                        cdp_cookie = {
+                            'name': str(name),
+                            'value': str(value),
+                            'domain': str(domain),
+                            'path': cookie.get('path', '/'),
+                        }
+                        
+                        # Add optional fields if present
+                        if cookie.get('secure'):
+                            cdp_cookie['secure'] = True
+                        if cookie.get('httpOnly'):
+                            cdp_cookie['httpOnly'] = True
+                        
+                        # Handle expiry / expirationDate
+                        expiry = cookie.get('expiry') or cookie.get('expirationDate')
+                        if expiry:
+                            try:
+                                cdp_cookie['expires'] = float(expiry)
+                            except (ValueError, TypeError):
+                                pass
+                        
+                        # Handle sameSite (CDP accepts it, driver.add_cookie doesn't)
+                        same_site = cookie.get('sameSite', '')
+                        if same_site and same_site.lower() not in ('', 'unspecified', 'no_restriction', 'none'):
+                            cdp_cookie['sameSite'] = same_site.capitalize()
+                        else:
+                            cdp_cookie['sameSite'] = 'None'
+                            if not cdp_cookie.get('secure'):
+                                cdp_cookie['secure'] = True  # SameSite=None requires Secure
+                        
+                        # Use CDP to inject — bypasses all ChromeDriver validation
+                        result = self.driver.execute_cdp_cmd('Network.setCookie', cdp_cookie)
+                        
+                        if result.get('success', True):
+                            added += 1
+                        else:
                             failed += 1
-                            continue
-                        
-                        # Force the domain to match current page
-                        # This fixes leading-dot issues and subdomain mismatches
-                        clean['domain'] = 'app.apollo.io'
-                        
-                        self.driver.add_cookie(clean)
-                        added += 1
+                            log_message(f"⚠️  CDP rejected cookie {name}", 'DEBUG')
                         
                     except Exception as e:
                         failed += 1
                         log_message(f"⚠️  Failed to add cookie {cookie.get('name', '?')}: {e}", 'DEBUG')
                 
-                log_message(f"🍪 Cookies injected: {added} OK, {failed} skipped", 'INFO')
+                log_message(f"🍪 Cookies injected via CDP: {added} OK, {failed} failed", 'INFO')
                 
-                # =====================================================
                 # STEP 3: Refresh to activate cookies
-                # =====================================================
                 if added == 0:
                     log_message("❌ No cookies were injected! Auth will fail.", 'ERROR')
                     log_message("💡 Check that cookies are exported from app.apollo.io", 'INFO')
@@ -384,9 +367,7 @@ class ApolloScraper:
                 self.driver.refresh()
                 random_delay(3, 5)
                 
-                # =====================================================
-                # STEP 4: Verify we're actually logged in
-                # =====================================================
+                # STEP 4: Verify login
                 if self._is_logged_in():
                     log_message("🎉 Cookie authentication successful! Skipping login.", 'SUCCESS')
                     self.logged_in = True
