@@ -2,14 +2,14 @@
 Core scraping logic for Apollo.io with ADVANCED ANTI-DETECTION
 Uses undetected-chromedriver and multiple stealth techniques to bypass bot detection.
 
-*** FIXED VERSION v3 — CDP cookies + URL pagination for 15k+ leads ***
+*** FIXED VERSION v4 ***
 
-Changes from original:
-  FIX #1: CDP cookie injection (Network.setCookie) — bypasses ChromeDriver validation
-  FIX #2: Stricter _is_logged_in() — no false positives
-  FIX #3: SPA render wait in scrape_url() — waits for React table
-  FIX #4: URL-based pagination — reliable for 600+ pages (15k leads)
-  FIX #5: follow_links disabled in bulk mode — enriching 15k contacts is not viable
+Fix history:
+  v1: CDP cookie injection (Network.setCookie)
+  v2: Stricter _is_logged_in(), SPA render wait, URL pagination
+  v3: Bulk mode defaults (follow_links=False, dedup, cooldowns)
+  v4: CRITICAL — Chrome user-agent (Faker was generating IE8!),
+      modal/popup dismissal, HTML dump debugging, max_pages config
 """
 
 import undetected_chromedriver as uc
@@ -18,6 +18,7 @@ from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.common.exceptions import TimeoutException, NoSuchElementException
 from selenium.webdriver.common.action_chains import ActionChains
+from selenium.webdriver.common.keys import Keys
 from bs4 import BeautifulSoup
 import time
 import random
@@ -32,6 +33,23 @@ from src.parser import (
     parse_search_results, parse_contact_profile,
     parse_company_profile, detect_page_type
 )
+
+# =========================================================================
+# FIX v4: Modern Chrome user-agents ONLY
+# Faker generates random UAs including IE6-11, old Opera, mobile browsers.
+# Apollo's React SPA cannot render on IE8 — the table never loads.
+# These are real Chrome 120+ UAs that Apollo will always accept.
+# =========================================================================
+CHROME_USER_AGENTS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
+]
 
 
 class ApolloScraper:
@@ -58,9 +76,14 @@ class ApolloScraper:
         else:
             log_message("✅ Running in headful mode (less detectable)", 'INFO')
         
-        user_agent = self.faker.user_agent()
+        # =====================================================================
+        # FIX v4: Use MODERN CHROME user-agent, not Faker's random generator
+        # Faker can produce IE8, old Firefox, mobile Safari etc. which Apollo
+        # won't render properly (React SPA needs modern browser).
+        # =====================================================================
+        user_agent = random.choice(CHROME_USER_AGENTS)
         options.add_argument(f'user-agent={user_agent}')
-        log_message(f"Using user agent: {user_agent[:60]}...", 'DEBUG')
+        log_message(f"Using Chrome UA: ...Chrome/{user_agent.split('Chrome/')[1][:10]}...", 'DEBUG')
         
         # Essential stealth arguments
         options.add_argument('--disable-blink-features=AutomationControlled')
@@ -115,111 +138,148 @@ class ApolloScraper:
     def _inject_advanced_stealth(self):
         """Inject advanced JavaScript to further hide automation"""
         stealth_js = """
-        // 1. Remove webdriver property
-        try {
-            Object.defineProperty(navigator, 'webdriver', {
-                get: () => undefined, configurable: true
-            });
-        } catch(e) {}
-        
-        // 2. Fix plugins
-        try {
-            Object.defineProperty(navigator, 'plugins', {
-                get: () => [1, 2, 3, 4, 5], configurable: true
-            });
-        } catch(e) {}
-        
-        // 3. Fix languages
-        try {
-            Object.defineProperty(navigator, 'languages', {
-                get: () => ['en-US', 'en'], configurable: true
-            });
-        } catch(e) {}
-        
-        // 4. Chrome property
+        try { Object.defineProperty(navigator, 'webdriver', { get: () => undefined, configurable: true }); } catch(e) {}
+        try { Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5], configurable: true }); } catch(e) {}
+        try { Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'], configurable: true }); } catch(e) {}
         try {
             if (!window.navigator.chrome) {
-                window.navigator.chrome = {
-                    runtime: {}, loadTimes: function() {},
-                    csi: function() {}, app: {}
-                };
+                window.navigator.chrome = { runtime: {}, loadTimes: function() {}, csi: function() {}, app: {} };
             }
         } catch(e) {}
-        
-        // 5. Permissions query
         try {
-            const originalQuery = window.navigator.permissions.query;
-            window.navigator.permissions.query = (parameters) => (
-                parameters.name === 'notifications' ?
-                    Promise.resolve({state: Notification.permission}) :
-                    originalQuery(parameters)
-            );
+            const oq = window.navigator.permissions.query;
+            window.navigator.permissions.query = (p) => (p.name === 'notifications' ? Promise.resolve({state: Notification.permission}) : oq(p));
         } catch(e) {}
-        
-        // 6. Fix iframe detection
-        try {
-            Object.defineProperty(HTMLIFrameElement.prototype, 'contentWindow', {
-                get: function() { return window; }
-            });
-        } catch(e) {}
-        
-        // 7. Hardware concurrency
-        try {
-            Object.defineProperty(navigator, 'hardwareConcurrency', {
-                get: () => 8, configurable: true
-            });
-        } catch(e) {}
-        
-        // 8. Device memory
-        try {
-            Object.defineProperty(navigator, 'deviceMemory', {
-                get: () => 8, configurable: true
-            });
-        } catch(e) {}
-        
-        console.log('🔒 Advanced stealth mode activated');
+        try { Object.defineProperty(HTMLIFrameElement.prototype, 'contentWindow', { get: function() { return window; } }); } catch(e) {}
+        try { Object.defineProperty(navigator, 'hardwareConcurrency', { get: () => 8, configurable: true }); } catch(e) {}
+        try { Object.defineProperty(navigator, 'deviceMemory', { get: () => 8, configurable: true }); } catch(e) {}
+        console.log('🔒 Stealth active');
         """
         try:
-            self.driver.execute_cdp_cmd('Page.addScriptToEvaluateOnNewDocument', {
-                'source': stealth_js
-            })
+            self.driver.execute_cdp_cmd('Page.addScriptToEvaluateOnNewDocument', {'source': stealth_js})
             log_message("✅ Advanced stealth JavaScript injected", 'DEBUG')
         except Exception as e:
             log_message(f"⚠️  Stealth injection warning: {e}", 'WARNING')
     
     def _human_like_mouse_movement(self, element):
-        """Simulate human-like mouse movement to element"""
         try:
             actions = ActionChains(self.driver)
-            offset_x = random.randint(-5, 5)
-            offset_y = random.randint(-5, 5)
-            actions.move_to_element_with_offset(element, offset_x, offset_y)
+            actions.move_to_element_with_offset(element, random.randint(-5, 5), random.randint(-5, 5))
             actions.perform()
             random_delay(0.1, 0.3)
         except Exception as e:
             log_message(f"Mouse movement failed: {e}", 'DEBUG')
     
     def _human_like_typing(self, element, text: str):
-        """Type text with human-like patterns and delays"""
         element.clear()
         random_delay(0.2, 0.5)
-        
         for i, char in enumerate(text):
             element.send_keys(char)
             if i % 5 == 0:
                 random_delay(0.15, 0.35)
             else:
                 random_delay(0.05, 0.12)
-            
             if random.random() < 0.1 and i < len(text) - 1:
-                wrong_char = random.choice('abcdefghijklmnopqrstuvwxyz')
-                element.send_keys(wrong_char)
+                element.send_keys(random.choice('abcdefghijklmnopqrstuvwxyz'))
                 random_delay(0.1, 0.2)
                 element.send_keys('\b')
                 random_delay(0.05, 0.15)
     
+    # =========================================================================
+    # FIX v4: Dismiss modals/popups that block the search results table
+    # Apollo shows various overlays: upgrade prompts, onboarding wizards,
+    # trial notifications, "What's new" modals, cookie consent, etc.
+    # =========================================================================
+    def _dismiss_modals(self):
+        """Try to close any modal/popup/overlay blocking the page content"""
+        log_message("🔍 Checking for modals/popups to dismiss...", 'DEBUG')
+        dismissed = 0
+        
+        # Strategy 1: Click common close buttons (X icons, dismiss, close, skip)
+        close_selectors = [
+            "button[aria-label='Close']",
+            "button[aria-label='close']",
+            "[class*='modal'] button[class*='close']",
+            "[class*='modal'] [class*='dismiss']",
+            "[class*='overlay'] button",
+            "[class*='popup'] button[class*='close']",
+            "button[class*='close-button']",
+            "[data-cy='close-modal']",
+            "[data-cy='dismiss']",
+            # Apollo-specific selectors
+            "[class*='zp_'] button[class*='close']",
+            "[class*='upgrade'] button[class*='close']",
+            "[class*='trial'] button[class*='dismiss']",
+            "button[class*='skip']",
+            "[class*='onboarding'] button",
+            # Generic X button (last resort)
+            "[class*='modal'] svg",
+        ]
+        
+        for selector in close_selectors:
+            try:
+                buttons = self.driver.find_elements(By.CSS_SELECTOR, selector)
+                for btn in buttons:
+                    if btn.is_displayed():
+                        btn.click()
+                        dismissed += 1
+                        log_message(f"✅ Dismissed modal via: {selector}", 'DEBUG')
+                        random_delay(0.5, 1.0)
+                        break  # One click per selector to avoid double-clicks
+            except:
+                continue
+        
+        # Strategy 2: Press Escape key (works for most modal implementations)
+        try:
+            body = self.driver.find_element(By.TAG_NAME, 'body')
+            body.send_keys(Keys.ESCAPE)
+            random_delay(0.3, 0.5)
+            body.send_keys(Keys.ESCAPE)  # Some modals need double-escape
+            random_delay(0.3, 0.5)
+            dismissed += 1
+        except:
+            pass
+        
+        # Strategy 3: Click backdrop/overlay
+        try:
+            overlays = self.driver.find_elements(By.CSS_SELECTOR,
+                "[class*='backdrop'], [class*='overlay'], [class*='mask']"
+            )
+            for overlay in overlays:
+                if overlay.is_displayed():
+                    # Click at the edge of the overlay (not center which may be the modal)
+                    actions = ActionChains(self.driver)
+                    actions.move_to_element_with_offset(overlay, 10, 10).click().perform()
+                    dismissed += 1
+                    random_delay(0.3, 0.5)
+                    break
+        except:
+            pass
+        
+        if dismissed > 0:
+            log_message(f"🔕 Dismissed {dismissed} modal(s)/popup(s)", 'INFO')
+        else:
+            log_message("✅ No modals detected", 'DEBUG')
+    
+    def _dump_page_html(self, label: str = "debug"):
+        """Save page HTML to /tmp for debugging (not just screenshot)"""
+        try:
+            html = self.driver.page_source
+            filepath = f'/tmp/apollo_{label}.html'
+            with open(filepath, 'w', encoding='utf-8') as f:
+                f.write(html)
+            log_message(f"📄 Page HTML saved to {filepath} ({len(html)} chars)", 'DEBUG')
+            
+            # Quick summary of what's in the HTML
+            soup = BeautifulSoup(html, 'html.parser')
+            tables = soup.find_all('table')
+            trs = soup.find_all('tr')
+            divs_with_zp = soup.find_all(class_=_re.compile(r'zp_'))
+            log_message(f"📊 HTML stats: {len(tables)} tables, {len(trs)} tr rows, {len(divs_with_zp)} zp_ elements", 'DEBUG')
+        except Exception as e:
+            log_message(f"⚠️  HTML dump failed: {e}", 'DEBUG')
+    
     def save_cookies(self, filename: str = '/tmp/apollo_cookies.json'):
-        """Save cookies for future sessions"""
         try:
             cookies = self.driver.get_cookies()
             with open(filename, 'w') as f:
@@ -231,12 +291,7 @@ class ApolloScraper:
             return None
     
     # =========================================================================
-    # FIX #1: Cookie injection via Chrome DevTools Protocol (CDP)
-    #
-    # driver.add_cookie() uses ChromeDriver's strict validation which rejects
-    # cookies for domain mismatch, sameSite, extra fields, etc.
-    # CDP Network.setCookie bypasses ALL validation and injects directly into
-    # Chrome's cookie store — same mechanism as Chrome DevTools.
+    # FIX v1: Cookie injection via CDP (bypasses ChromeDriver validation)
     # =========================================================================
     def load_cookies(self, cookies: List[Dict] = None, filename: str = '/tmp/apollo_cookies.json'):
         """Load cookies using CDP (bypasses ChromeDriver's broken validation)"""
@@ -253,14 +308,12 @@ class ApolloScraper:
             if not cookies:
                 return False
             
-            # STEP 1: Navigate to Apollo domain first (required for cookie scope)
             self.driver.get("https://app.apollo.io")
             random_delay(2, 4)
             
             current_url = self.driver.current_url
             log_message(f"🔍 Browser landed on: {current_url}", 'INFO')
             
-            # STEP 2: Inject ALL cookies via CDP — no validation, no errors
             added = 0
             failed = 0
             
@@ -268,15 +321,11 @@ class ApolloScraper:
                 try:
                     name = cookie.get('name', '')
                     value = cookie.get('value', '')
-                    
                     if not name or not value:
                         failed += 1
                         continue
                     
-                    # Preserve original domain from export
                     domain = cookie.get('domain', '.apollo.io')
-                    
-                    # Build CDP cookie params
                     cdp_cookie = {
                         'name': str(name),
                         'value': str(value),
@@ -284,13 +333,11 @@ class ApolloScraper:
                         'path': cookie.get('path', '/'),
                     }
                     
-                    # Optional fields
                     if cookie.get('secure'):
                         cdp_cookie['secure'] = True
                     if cookie.get('httpOnly'):
                         cdp_cookie['httpOnly'] = True
                     
-                    # Handle expiry (EditThisCookie uses expirationDate)
                     expiry = cookie.get('expiry') or cookie.get('expirationDate')
                     if expiry:
                         try:
@@ -298,24 +345,20 @@ class ApolloScraper:
                         except (ValueError, TypeError):
                             pass
                     
-                    # Handle sameSite (CDP accepts it; driver.add_cookie chokes)
                     same_site = cookie.get('sameSite', '')
                     if same_site and same_site.lower() not in ('', 'unspecified', 'no_restriction', 'none'):
                         cdp_cookie['sameSite'] = same_site.capitalize()
                     else:
                         cdp_cookie['sameSite'] = 'None'
                         if not cdp_cookie.get('secure'):
-                            cdp_cookie['secure'] = True  # SameSite=None requires Secure
+                            cdp_cookie['secure'] = True
                     
-                    # CDP injection — bypasses ALL ChromeDriver validation
                     result = self.driver.execute_cdp_cmd('Network.setCookie', cdp_cookie)
-                    
                     if result.get('success', True):
                         added += 1
                     else:
                         failed += 1
                         log_message(f"⚠️  CDP rejected cookie {name}", 'DEBUG')
-                    
                 except Exception as e:
                     failed += 1
                     log_message(f"⚠️  Failed to add cookie {cookie.get('name', '?')}: {e}", 'DEBUG')
@@ -327,17 +370,19 @@ class ApolloScraper:
                 log_message("💡 Check that cookies are exported from app.apollo.io", 'INFO')
                 return False
             
-            # STEP 3: Refresh to activate cookies in the session
             self.driver.refresh()
             random_delay(3, 5)
             
-            # STEP 4: Verify login
+            # Dismiss any post-login modals/popups
+            self._dismiss_modals()
+            
             if self._is_logged_in():
                 log_message("🎉 Cookie authentication successful! Skipping login.", 'SUCCESS')
                 self.logged_in = True
                 return True
             else:
                 log_message("⚠️  Cookies loaded but not logged in — cookies may be expired", 'WARNING')
+                self._dump_page_html("login_failed")
                 return False
             
         except Exception as e:
@@ -346,13 +391,9 @@ class ApolloScraper:
     
     @retry_on_failure(max_retries=3)
     def login(self, email: str = None, password: str = None, cookies: List[Dict] = None):
-        """
-        Login to Apollo.io — tries cookies first, falls back to password.
-        """
         if not self.driver:
             self.setup_driver()
         
-        # Try cookie auth first (most reliable)
         if cookies:
             log_message("🔑 Attempting cookie-based authentication...", 'INFO')
             if self.load_cookies(cookies=cookies):
@@ -371,7 +412,6 @@ class ApolloScraper:
             log_message("⏳ Waiting for login page to load...", 'INFO')
             random_delay(3, 5)
             
-            # Random mouse movements
             try:
                 body = self.driver.find_element(By.TAG_NAME, 'body')
                 for _ in range(random.randint(1, 3)):
@@ -379,7 +419,6 @@ class ApolloScraper:
             except:
                 pass
             
-            # Debug
             try:
                 self.driver.save_screenshot('/tmp/login_page.png')
                 log_message(f"📸 Screenshot saved. Page title: {self.driver.title}", 'INFO')
@@ -409,47 +448,38 @@ class ApolloScraper:
             
             log_message("🔍 Looking for password field...", 'INFO')
             password_field = self.driver.find_element(
-                By.CSS_SELECTOR,
-                "input[name='password'], input[type='password']"
+                By.CSS_SELECTOR, "input[name='password'], input[type='password']"
             )
-            
             self._human_like_mouse_movement(password_field)
             random_delay(0.3, 0.7)
             self._human_like_typing(password_field, password)
             random_delay(0.8, 1.5)
             
-            try:
-                self._human_like_mouse_movement(password_field)
-            except:
-                pass
-            
             log_message("🔍 Looking for login button...", 'INFO')
             try:
                 login_button = self.driver.find_element(By.CSS_SELECTOR, "button[type='submit']")
             except:
-                login_button = self.driver.find_element(
-                    By.XPATH,
-                    "//button[contains(text(), 'Sign in') or contains(text(), 'Log in') "
-                    "or contains(text(), 'sign in') or contains(text(), 'log in')]"
-                )
+                login_button = self.driver.find_element(By.XPATH,
+                    "//button[contains(text(), 'Sign in') or contains(text(), 'Log in')]")
             
             self._human_like_mouse_movement(login_button)
             random_delay(0.3, 0.6)
             login_button.click()
             
-            log_message("✉️  Login form submitted, waiting for response...", 'INFO')
+            log_message("✉️  Login form submitted, waiting...", 'INFO')
             random_delay(5, 8)
             
             if self._check_for_captcha():
-                log_message("❌ CAPTCHA detected after login! Session flagged.", 'ERROR')
-                log_message("💡 SOLUTION: Use cookie-based authentication!", 'INFO')
+                log_message("❌ CAPTCHA detected after login!", 'ERROR')
                 return False
+            
+            # Dismiss post-login modals
+            self._dismiss_modals()
             
             if self._is_logged_in():
                 log_message("🎉 Login successful!", 'SUCCESS')
                 self.logged_in = True
                 self.save_cookies()
-                log_message("💡 TIP: Use saved cookies next time to skip login!", 'INFO')
                 return True
             else:
                 try:
@@ -459,7 +489,7 @@ class ApolloScraper:
                     else:
                         log_message("❌ Login failed: Unknown error", 'ERROR')
                 except:
-                    log_message("❌ Login failed: Could not verify login status", 'ERROR')
+                    log_message("❌ Login failed", 'ERROR')
                 return False
                 
         except TimeoutException:
@@ -474,13 +504,8 @@ class ApolloScraper:
                 pass
             return False
     
-    # =========================================================================
-    # FIX #2: Stricter login check — no false positives from URL alone
-    # =========================================================================
     def _is_logged_in(self) -> bool:
-        """Check if currently logged into Apollo"""
         try:
-            # Look for elements that only appear when authenticated
             WebDriverWait(self.driver, 10).until(
                 EC.presence_of_element_located((
                     By.CSS_SELECTOR,
@@ -493,12 +518,9 @@ class ApolloScraper:
         except:
             pass
         
-        # Fallback: URL + content check
         current_url = self.driver.current_url
         is_on_apollo = 'app.apollo.io' in current_url
-        is_on_auth_page = any(x in current_url.lower() for x in [
-            'login', 'signup', 'sign-up', 'register'
-        ])
+        is_on_auth_page = any(x in current_url.lower() for x in ['login', 'signup', 'sign-up', 'register'])
         
         if is_on_apollo and not is_on_auth_page:
             try:
@@ -512,38 +534,28 @@ class ApolloScraper:
             except:
                 pass
         
-        if not is_on_apollo:
-            log_message(f"Not logged in. Current URL: {current_url}", 'DEBUG')
-        
         return is_on_apollo and not is_on_auth_page
     
     def _check_for_captcha(self) -> bool:
-        """Check if CAPTCHA is present on page"""
-        captcha_indicators = [
-            "recaptcha", "captcha", "hcaptcha", "challenge", "cf-challenge"
-        ]
+        captcha_indicators = ["recaptcha", "captcha", "hcaptcha", "challenge", "cf-challenge"]
         page_source = self.driver.page_source.lower()
         detected = any(indicator in page_source for indicator in captcha_indicators)
-        
         if detected:
             log_message("⚠️  CAPTCHA detected on page!", 'WARNING')
             try:
                 self.driver.save_screenshot('/tmp/captcha_detected.png')
             except:
                 pass
-        
         return detected
     
     # =========================================================================
-    # FIX #3: Wait for Apollo SPA to render before detecting page type
+    # FIX v3+v4: scrape_url with SPA wait, modal dismiss, HTML debug dump
     # =========================================================================
     def scrape_url(self, url: str, follow_links: bool = False, max_pages: int = None,
                    min_delay: int = 3, max_delay: int = 7) -> List[Dict[str, Any]]:
         """
-        Scrape data from a given Apollo.io URL.
-        
-        NOTE: follow_links defaults to False for bulk scrapes (15k leads).
-              Enriching each contact individually would take days.
+        Scrape data from Apollo.io URL.
+        follow_links=False by default for bulk (15k leads).
         """
         if not is_valid_url(url):
             log_message(f"❌ Invalid Apollo.io URL: {url}", 'ERROR')
@@ -557,8 +569,21 @@ class ApolloScraper:
         self.driver.get(url)
         random_delay(min_delay, max_delay)
         
-        # Wait for Apollo's React SPA to render
-        self._wait_for_table_render(timeout=20)
+        # Dismiss any popups that appeared on navigation
+        self._dismiss_modals()
+        
+        # Wait for React SPA to render
+        self._wait_for_table_render(timeout=25)
+        
+        # If table still not found, try dismissing modals again + longer wait
+        # (sometimes modals take a moment to appear)
+        try:
+            self.driver.find_element(By.CSS_SELECTOR, "table tbody tr")
+        except:
+            log_message("⚠️  Table not found, trying modal dismiss + extra wait...", 'WARNING')
+            self._dismiss_modals()
+            random_delay(3, 5)
+            self._wait_for_table_render(timeout=15)
         
         # Human-like scroll
         try:
@@ -567,20 +592,21 @@ class ApolloScraper:
         except:
             pass
         
-        # Debug screenshot
+        # Debug: screenshot + HTML dump
         try:
             self.driver.save_screenshot('/tmp/page_before_detect.png')
-            log_message(f"📸 Page screenshot saved. Title: {self.driver.title}", 'DEBUG')
+            log_message(f"📸 Screenshot saved. Title: {self.driver.title}", 'DEBUG')
             log_message(f"🌐 Current URL: {self.driver.current_url}", 'DEBUG')
         except:
             pass
+        self._dump_page_html("before_detect")
         
         # Detect page type
         page_html = self.driver.page_source
         page_type = detect_page_type(page_html)
         log_message(f"📄 Detected page type: {page_type}", 'INFO')
         
-        # URL-based fallback if detection fails
+        # URL-based fallback
         if page_type == 'unknown':
             if '#/people' in url or '/people' in url:
                 log_message("🔄 URL contains /people — forcing page type to 'search'", 'INFO')
@@ -600,31 +626,17 @@ class ApolloScraper:
             return [self._scrape_generic_page()]
     
     # =========================================================================
-    # FIX #4: URL-based pagination for 15k+ leads
-    #
-    # Old code relied on clicking "Next" button — fragile, breaks on Apollo's
-    # dynamic DOM. URL pagination (page=N) is 100% reliable.
-    #
+    # FIX v3: URL-based pagination for 15k+ leads
     # 25 results/page × 600 pages = 15,000 leads
     # =========================================================================
     def _scrape_search_results(self, base_url: str, follow_links: bool = False,
                                max_pages: int = None, min_delay: int = 3,
                                max_delay: int = 7) -> List[Dict[str, Any]]:
-        """
-        Scrape search results with URL-based pagination.
-        
-        Args:
-            base_url: The original Apollo search URL
-            follow_links: Visit each profile for enrichment (SLOW — False for bulk)
-            max_pages: Maximum pages to scrape (default from Config)
-            min_delay: Min seconds between pages
-            max_delay: Max seconds between pages
-        """
         all_results = []
         page_num = 1
         max_pages = max_pages or Config.MAX_PAGES
         consecutive_empty = 0
-        seen_names = set()  # Deduplicate across pages
+        seen_names = set()
         
         log_message(f"📊 Starting bulk scrape (max {max_pages} pages, ~{max_pages * 25} leads)...", 'INFO')
         if follow_links:
@@ -633,15 +645,15 @@ class ApolloScraper:
         while page_num <= max_pages:
             log_message(f"📄 Scraping page {page_num}/{max_pages}...", 'INFO')
             
-            # Navigate to page via URL (pages 2+ need explicit navigation)
             if page_num > 1:
                 page_url = self._build_page_url(base_url, page_num)
                 log_message(f"🌐 Navigating to page {page_num}...", 'DEBUG')
                 self.driver.get(page_url)
                 random_delay(min_delay, max_delay)
+                self._dismiss_modals()
                 self._wait_for_table_render(timeout=15)
             
-            # Human-like scrolling to trigger lazy-loaded rows
+            # Human scrolling to trigger lazy rows
             try:
                 self.driver.execute_script(f"window.scrollTo(0, {random.randint(200, 500)});")
                 random_delay(0.5, 1.0)
@@ -652,34 +664,37 @@ class ApolloScraper:
             except:
                 pass
             
-            # Parse current page
             page_html = self.driver.page_source
             results = parse_search_results(page_html)
             
-            # Handle empty page
             if not results:
                 consecutive_empty += 1
                 log_message(f"⚠️  No results on page {page_num} (empty streak: {consecutive_empty})", 'WARNING')
                 
-                # Retry once — sometimes Apollo's SPA fails to load a page
                 if consecutive_empty == 1:
                     log_message("🔄 Retrying page...", 'INFO')
+                    self._dismiss_modals()
                     self.driver.refresh()
                     random_delay(3, 5)
+                    self._dismiss_modals()
                     self._wait_for_table_render(timeout=15)
                     page_html = self.driver.page_source
                     results = parse_search_results(page_html)
+                    
+                    # Dump HTML on first empty page for debugging
+                    if not results:
+                        self._dump_page_html(f"empty_page_{page_num}")
                 
                 if not results:
-                    if consecutive_empty >= 2:
-                        log_message("🛑 2 consecutive empty pages — end of results reached", 'INFO')
+                    if consecutive_empty >= 3:
+                        log_message("🛑 3 consecutive empty pages — end of results", 'INFO')
                         break
                     page_num += 1
                     continue
             
-            consecutive_empty = 0  # Reset on success
+            consecutive_empty = 0
             
-            # Deduplicate by name
+            # Deduplicate
             new_results = []
             for r in results:
                 name = r.get('name', '')
@@ -693,20 +708,17 @@ class ApolloScraper:
             
             log_message(f"✅ Page {page_num}: {len(new_results)} new results (total: {len(all_results) + len(new_results)})", 'SUCCESS')
             
-            # Enrich if requested (not recommended for bulk)
             if follow_links:
                 new_results = self._enrich_results(new_results)
             
             all_results.extend(new_results)
             
-            # Progress logging every 10 pages
             if page_num % 10 == 0:
                 log_message(f"📊 Progress: {len(all_results)} total leads after {page_num} pages", 'INFO')
             
-            # Adaptive cooldown every 50 pages to avoid rate limits
             if page_num % 50 == 0:
                 cooldown = random.randint(10, 20)
-                log_message(f"😴 Cooldown pause: {cooldown}s (anti rate-limit)", 'INFO')
+                log_message(f"😴 Cooldown: {cooldown}s (anti rate-limit)", 'INFO')
                 time.sleep(cooldown)
             
             page_num += 1
@@ -716,29 +728,17 @@ class ApolloScraper:
         return all_results
     
     def _build_page_url(self, base_url: str, page_num: int) -> str:
-        """
-        Build URL for a specific page number.
-        Apollo uses page=N in the URL hash fragment.
-        Example: ...#/people?page=1&personTitles[]=CEO
-        """
-        # Replace existing page=N
         if 'page=' in base_url:
             return _re.sub(r'page=\d+', f'page={page_num}', base_url)
-        
-        # Add page parameter
         if '#' in base_url:
             hash_part = base_url.split('#', 1)[1]
             if '?' in hash_part:
-                # Already has query params after hash: append &page=N
                 return base_url + f'&page={page_num}'
             else:
-                # Hash path only: add ?page=N
                 return base_url + f'?page={page_num}'
-        else:
-            return base_url + f'?page={page_num}'
+        return base_url + f'?page={page_num}'
     
     def _wait_for_table_render(self, timeout: int = 15):
-        """Wait for Apollo's React table to render after navigation"""
         try:
             WebDriverWait(self.driver, timeout).until(
                 EC.presence_of_element_located((
@@ -759,97 +759,61 @@ class ApolloScraper:
             log_message(f"⚠️  Table didn't render within {timeout}s", 'WARNING')
     
     def _enrich_results(self, results: List[Dict]) -> List[Dict]:
-        """
-        Enrich results by visiting individual profile pages.
-        WARNING: Very slow for large datasets — adds ~5s per contact.
-        """
         enriched = []
         log_message(f"🔍 Enriching {len(results)} results...", 'INFO')
-        
         for idx, result in enumerate(results, 1):
             profile_url = result.get('profile_url')
-            
             if profile_url:
                 try:
-                    log_message(f"🔗 Enriching contact {idx}/{len(results)}...", 'DEBUG')
                     self.driver.get(profile_url)
                     random_delay(2, 4)
-                    detailed_data = self._scrape_contact_profile()
-                    result.update(detailed_data)
+                    result.update(self._scrape_contact_profile())
                     self.driver.back()
                     random_delay(2, 3)
                 except Exception as e:
-                    log_message(f"⚠️  Failed to enrich contact: {str(e)}", 'WARNING')
-            
+                    log_message(f"⚠️  Enrich failed: {e}", 'WARNING')
             enriched.append(result)
-        
         return enriched
     
     def _go_to_next_page(self) -> bool:
-        """
-        Navigate to next page via button click (FALLBACK only).
-        URL-based pagination in _scrape_search_results is preferred.
-        """
         try:
-            next_button_selectors = [
-                "button[aria-label='Next page']",
-                "a[aria-label='Next']",
-                ".pagination button:last-child",
-                "[class*='next']:not([disabled])",
+            for selector in [
+                "button[aria-label='Next page']", "a[aria-label='Next']",
+                ".pagination button:last-child", "[class*='next']:not([disabled])",
                 "button[class*='next']",
-                "[class*='zp_'] [class*='next']",
-                "button[class*='pagination'] + button",
-            ]
-            
-            for selector in next_button_selectors:
+            ]:
                 try:
-                    next_button = self.driver.find_element(By.CSS_SELECTOR, selector)
-                    if next_button.is_enabled() and next_button.is_displayed():
-                        self._human_like_mouse_movement(next_button)
+                    btn = self.driver.find_element(By.CSS_SELECTOR, selector)
+                    if btn.is_enabled() and btn.is_displayed():
+                        self._human_like_mouse_movement(btn)
                         random_delay(0.3, 0.6)
-                        next_button.click()
-                        log_message("➡️  Clicked next page button", 'DEBUG')
+                        btn.click()
                         return True
                 except:
                     continue
             
-            # Infinite scroll fallback
-            last_height = self.driver.execute_script("return document.body.scrollHeight")
+            last_h = self.driver.execute_script("return document.body.scrollHeight")
             self.driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
             random_delay(2, 3)
-            new_height = self.driver.execute_script("return document.body.scrollHeight")
-            
-            if new_height > last_height:
-                log_message("📜 Infinite scroll triggered", 'DEBUG')
-                return True
-            
-            return False
-            
-        except Exception as e:
-            log_message(f"⚠️  Could not navigate to next page: {str(e)}", 'DEBUG')
+            return self.driver.execute_script("return document.body.scrollHeight") > last_h
+        except:
             return False
     
     def _scrape_contact_profile(self) -> Dict[str, Any]:
-        """Scrape current page as contact profile"""
         return parse_contact_profile(self.driver.page_source)
     
     def _scrape_company_profile(self) -> Dict[str, Any]:
-        """Scrape current page as company profile"""
         return parse_company_profile(self.driver.page_source)
     
     def _scrape_generic_page(self) -> Dict[str, Any]:
-        """Generic scraping for unknown page types"""
         soup = BeautifulSoup(self.driver.page_source, 'lxml')
         return {
-            'type': 'generic',
-            'url': self.driver.current_url,
-            'title': self.driver.title,
-            'text_content': soup.get_text()[:1000],
+            'type': 'generic', 'url': self.driver.current_url,
+            'title': self.driver.title, 'text_content': soup.get_text()[:1000],
             'scraped_at': time.strftime('%Y-%m-%d %H:%M:%S')
         }
     
     def close(self):
-        """Close the browser and cleanup"""
         if self.driver:
             log_message("🔒 Closing browser...", 'INFO')
             try:
