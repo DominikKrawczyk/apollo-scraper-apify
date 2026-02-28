@@ -280,17 +280,45 @@ class ApolloScraper:
                 self.driver.get("https://app.apollo.io")
                 random_delay(1, 2)
                 
-                # Add cookies
+               # Add cookies (sanitize fields Selenium doesn't accept)
+                # Selenium only accepts: name, value, domain, path, expiry, secure, httpOnly
+                ALLOWED_KEYS = {'name', 'value', 'domain', 'path', 'expiry', 'secure', 'httpOnly'}
+                added = 0
+                failed = 0
                 for cookie in cookies:
                     try:
-                        # Remove expiry if it's in the past
-                        if 'expiry' in cookie:
-                            cookie['expiry'] = int(cookie['expiry'])
-                        self.driver.add_cookie(cookie)
+                        # Strip fields that Selenium/ChromeDriver rejects
+                        # (sameSite, storeId, hostOnly, session, id, expirationDate, etc.)
+                        clean = {k: v for k, v in cookie.items() if k in ALLOWED_KEYS}
+                        
+                        # Fix expiry — some extensions export as "expirationDate" instead
+                        if 'expiry' not in clean and 'expirationDate' in cookie:
+                            clean['expiry'] = int(cookie['expirationDate'])
+                        elif 'expiry' in clean:
+                            try:
+                                clean['expiry'] = int(clean['expiry'])
+                            except (ValueError, TypeError):
+                                del clean['expiry']
+                        
+                        # Skip cookies not for apollo.io domain
+                        if 'domain' in clean and clean['domain']:
+                            if 'apollo.io' not in clean['domain']:
+                                failed += 1
+                                continue
+                        
+                        # Must have name and value at minimum
+                        if 'name' not in clean or 'value' not in clean:
+                            failed += 1
+                            continue
+                        
+                        self.driver.add_cookie(clean)
+                        added += 1
                     except Exception as e:
-                        log_message(f"⚠️  Failed to add cookie: {e}", 'DEBUG')
+                        failed += 1
+                        log_message(f"⚠️  Failed to add cookie {cookie.get('name', '?')}: {e}", 'DEBUG')
                 
-                log_message("✅ Cookies loaded successfully!", 'SUCCESS')
+                log_message(f"🍪 Cookies injected: {added} OK, {failed} skipped", 'INFO')
+                
                 
                 # Refresh to apply cookies
                 self.driver.refresh()
@@ -743,4 +771,5 @@ class ApolloScraper:
     def __exit__(self, exc_type, exc_val, exc_tb):
         """Context manager exit"""
         self.close()
+
 
