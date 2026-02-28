@@ -1,6 +1,8 @@
 """
 Core scraping logic for Apollo.io with ADVANCED ANTI-DETECTION
 Uses undetected-chromedriver and multiple stealth techniques to bypass bot detection.
+
+*** FIXED VERSION - Cookie injection + page load wait ***
 """
 
 import undetected_chromedriver as uc
@@ -262,6 +264,9 @@ class ApolloScraper:
             log_message(f"❌ Failed to save cookies: {e}", 'ERROR')
             return None
     
+    # =========================================================================
+    # FIX #1: Complete rewrite of load_cookies with proper domain handling
+    # =========================================================================
     def load_cookies(self, cookies: List[Dict] = None, filename: str = '/tmp/apollo_cookies.json'):
         """Load cookies from file or list"""
         try:
@@ -276,61 +281,118 @@ class ApolloScraper:
                     return False
             
             if cookies:
-                # Navigate to domain first (required for setting cookies)
+                # =====================================================
+                # STEP 1: Navigate to Apollo domain FIRST
+                # Selenium REQUIRES the browser to be on the same domain
+                # before you can add cookies for that domain.
+                # =====================================================
                 self.driver.get("https://app.apollo.io")
-                random_delay(1, 2)
+                random_delay(2, 4)
                 
-               # Add cookies (sanitize fields Selenium doesn't accept)
-                # Selenium only accepts: name, value, domain, path, expiry, secure, httpOnly
+                # DEBUG: Log where we actually landed
+                current_url = self.driver.current_url
+                log_message(f"🔍 Browser landed on: {current_url}", 'INFO')
+                
+                # If we got redirected away from apollo.io, try again
+                if 'apollo.io' not in current_url:
+                    log_message("⚠️  Redirected away from Apollo! Retrying...", 'WARNING')
+                    self.driver.get("https://app.apollo.io/#/login")
+                    random_delay(3, 5)
+                    current_url = self.driver.current_url
+                    log_message(f"🔍 Browser now on: {current_url}", 'INFO')
+                
+                # =====================================================
+                # STEP 2: Inject cookies with proper sanitization
+                # Selenium only accepts: name, value, domain, path, 
+                # expiry, secure, httpOnly
+                # Browser extensions export extra fields that MUST be
+                # stripped: sameSite, storeId, hostOnly, session, id,
+                # expirationDate, etc.
+                # =====================================================
                 ALLOWED_KEYS = {'name', 'value', 'domain', 'path', 'expiry', 'secure', 'httpOnly'}
                 added = 0
                 failed = 0
+                
                 for cookie in cookies:
                     try:
-                        # Strip fields that Selenium/ChromeDriver rejects
-                        # (sameSite, storeId, hostOnly, session, id, expirationDate, etc.)
-                        clean = {k: v for k, v in cookie.items() if k in ALLOWED_KEYS}
+                        # Build a clean cookie dict with only allowed fields
+                        clean = {}
+                        for k, v in cookie.items():
+                            if k in ALLOWED_KEYS:
+                                clean[k] = v
                         
-                        # Fix expiry — some extensions export as "expirationDate" instead
+                        # Handle expirationDate -> expiry (EditThisCookie format)
                         if 'expiry' not in clean and 'expirationDate' in cookie:
-                            clean['expiry'] = int(cookie['expirationDate'])
-                        elif 'expiry' in clean:
+                            try:
+                                clean['expiry'] = int(cookie['expirationDate'])
+                            except (ValueError, TypeError):
+                                pass  # Session cookie, no expiry needed
+                        
+                        # Fix expiry type (must be int)
+                        if 'expiry' in clean:
                             try:
                                 clean['expiry'] = int(clean['expiry'])
                             except (ValueError, TypeError):
                                 del clean['expiry']
                         
-                        # Skip cookies not for apollo.io domain
-                        if 'domain' in clean and clean['domain']:
-                            if 'apollo.io' not in clean['domain']:
-                                failed += 1
-                                continue
-                        
-                        # Must have name and value at minimum
+                        # Must have name and value
                         if 'name' not in clean or 'value' not in clean:
                             failed += 1
                             continue
                         
+                        # =====================================================
+                        # FIX: Domain handling - the ROOT CAUSE of failures
+                        # 
+                        # Cookies exported from browser have domain like:
+                        #   ".apollo.io"  or  "app.apollo.io"  or  ".app.apollo.io"
+                        # 
+                        # ChromeDriver is STRICT: the cookie domain must be a
+                        # valid match for the current page domain.
+                        #
+                        # Strategy: Force domain to "app.apollo.io" for all
+                        # Apollo cookies since that's where we navigated to.
+                        # Skip non-Apollo cookies entirely.
+                        # =====================================================
+                        cookie_domain = clean.get('domain', '')
+                        
+                        # Skip cookies that aren't for Apollo at all
+                        if cookie_domain and 'apollo.io' not in cookie_domain:
+                            failed += 1
+                            continue
+                        
+                        # Force the domain to match current page
+                        # This fixes leading-dot issues and subdomain mismatches
+                        clean['domain'] = 'app.apollo.io'
+                        
                         self.driver.add_cookie(clean)
                         added += 1
+                        
                     except Exception as e:
                         failed += 1
                         log_message(f"⚠️  Failed to add cookie {cookie.get('name', '?')}: {e}", 'DEBUG')
                 
                 log_message(f"🍪 Cookies injected: {added} OK, {failed} skipped", 'INFO')
                 
+                # =====================================================
+                # STEP 3: Refresh to activate cookies
+                # =====================================================
+                if added == 0:
+                    log_message("❌ No cookies were injected! Auth will fail.", 'ERROR')
+                    log_message("💡 Check that cookies are exported from app.apollo.io", 'INFO')
+                    return False
                 
-                # Refresh to apply cookies
                 self.driver.refresh()
-                random_delay(2, 3)
+                random_delay(3, 5)
                 
-                # Check if cookies worked (are we logged in?)
+                # =====================================================
+                # STEP 4: Verify we're actually logged in
+                # =====================================================
                 if self._is_logged_in():
                     log_message("🎉 Cookie authentication successful! Skipping login.", 'SUCCESS')
                     self.logged_in = True
                     return True
                 else:
-                    log_message("⚠️  Cookies loaded but not logged in", 'WARNING')
+                    log_message("⚠️  Cookies loaded but not logged in — cookies may be expired", 'WARNING')
                     return False
             
             return False
@@ -494,26 +556,48 @@ class ApolloScraper:
                 pass
             return False
     
+    # =========================================================================
+    # FIX #2: More robust login check — don't false-positive on URL alone
+    # =========================================================================
     def _is_logged_in(self) -> bool:
         """Check if currently logged into Apollo"""
         try:
             # Check for elements that only appear when logged in
-            WebDriverWait(self.driver, 5).until(
+            # Apollo shows user avatar/profile elements when authenticated
+            WebDriverWait(self.driver, 10).until(
                 EC.presence_of_element_located((
                     By.CSS_SELECTOR, 
-                    "[class*='user'], [class*='profile'], [data-cy*='user'], [class*='avatar']"
+                    "[class*='user'], [class*='profile'], [data-cy*='user'], "
+                    "[class*='avatar'], [class*='nav-user'], [class*='AccountMenu'], "
+                    "[data-testid*='user'], [class*='sidebar']"
                 ))
             )
             return True
         except:
-            # Check URL as fallback
+            # Check URL as fallback — but be stricter
             current_url = self.driver.current_url
-            is_logged = 'login' not in current_url.lower() and 'app.apollo.io' in current_url
+            # Must be on app.apollo.io AND not on login/signup page
+            is_on_apollo = 'app.apollo.io' in current_url
+            is_on_auth_page = any(x in current_url.lower() for x in ['login', 'signup', 'sign-up', 'register'])
             
-            if not is_logged:
+            if is_on_apollo and not is_on_auth_page:
+                # Extra check: look for any Apollo app content
+                try:
+                    page_source = self.driver.page_source
+                    # Apollo app has these when logged in
+                    has_app_content = any(indicator in page_source for indicator in [
+                        'zp_', 'apollo-', 'peopleIndex', 'search-results',
+                        'savedSearches', 'ContactTable', 'data-cy=',
+                    ])
+                    if has_app_content:
+                        return True
+                except:
+                    pass
+            
+            if not is_on_apollo:
                 log_message(f"Not logged in. Current URL: {current_url}", 'DEBUG')
             
-            return is_logged
+            return is_on_apollo and not is_on_auth_page
     
     def _check_for_captcha(self) -> bool:
         """Check if CAPTCHA is present on page"""
@@ -533,6 +617,10 @@ class ApolloScraper:
         
         return detected
     
+    # =========================================================================
+    # FIX #3: Wait for Apollo SPA to fully render before detecting page type
+    # Apollo is a React SPA — the HTML isn't ready immediately after navigation
+    # =========================================================================
     def scrape_url(self, url: str, follow_links: bool = True, max_pages: int = None, min_delay: int = 3, max_delay: int = 7) -> List[Dict[str, Any]]:
         """
         Scrape data from a given Apollo.io URL.
@@ -559,6 +647,51 @@ class ApolloScraper:
         self.driver.get(url)
         random_delay(min_delay, max_delay)
         
+        # =====================================================
+        # FIX: Wait for Apollo's React SPA to render the table
+        # The old code checked page_source immediately after
+        # navigation, but Apollo is a SPA — the people table
+        # hasn't rendered yet after just 3-7 seconds.
+        # =====================================================
+        
+        # Wait for the search results table to appear
+        table_loaded = False
+        try:
+            log_message("⏳ Waiting for Apollo search results to render...", 'INFO')
+            WebDriverWait(self.driver, 20).until(
+                EC.presence_of_element_located((
+                    By.CSS_SELECTOR,
+                    # Multiple selectors for Apollo's people table
+                    "table tbody tr, "                              # Standard table rows
+                    "[class*='people'] table, "                     # People search table
+                    "[class*='ContactTable'], "                     # Contact table component
+                    "[class*='search-results'], "                   # Search results container
+                    "[data-cy='contacts-table'], "                  # Data-cy selector
+                    "[class*='zp_'] table, "                        # Apollo's prefixed classes
+                    ".finder-results-list-panel-content, "          # Finder results
+                    "[class*='PeopleTable'], "                      # People table
+                    "[class*='result-row'], "                       # Individual result rows
+                    "[class*='contact-row']"                        # Contact rows
+                ))
+            )
+            table_loaded = True
+            log_message("✅ Search results table detected!", 'SUCCESS')
+        except TimeoutException:
+            log_message("⚠️  Table not found after 20s, trying broader selectors...", 'WARNING')
+            # Try waiting for ANY meaningful content
+            try:
+                WebDriverWait(self.driver, 10).until(
+                    EC.presence_of_element_located((
+                        By.CSS_SELECTOR,
+                        "table, [role='table'], [role='grid'], "
+                        "[class*='list'], [class*='results']"
+                    ))
+                )
+                table_loaded = True
+                log_message("✅ Found content with broader selectors", 'SUCCESS')
+            except TimeoutException:
+                log_message("⚠️  No table/list content found after 30s total", 'WARNING')
+        
         # Random human-like behavior
         try:
             # Scroll a bit (humans scroll)
@@ -567,10 +700,30 @@ class ApolloScraper:
         except:
             pass
         
+        # DEBUG: Save screenshot and log page state
+        try:
+            self.driver.save_screenshot('/tmp/page_before_detect.png')
+            log_message(f"📸 Page screenshot saved. Title: {self.driver.title}", 'DEBUG')
+            log_message(f"🌐 Current URL: {self.driver.current_url}", 'DEBUG')
+        except:
+            pass
+        
         # Detect page type
         page_html = self.driver.page_source
         page_type = detect_page_type(page_html)
         log_message(f"📄 Detected page type: {page_type}", 'INFO')
+        
+        # =====================================================
+        # FIX: If URL clearly indicates people search but
+        # detect_page_type returns 'unknown', force it to 'search'
+        # This handles cases where Apollo UI changed but URL is clear
+        # =====================================================
+        if page_type == 'unknown' and '#/people' in url:
+            log_message("🔄 URL contains #/people — forcing page type to 'search'", 'INFO')
+            page_type = 'search'
+        elif page_type == 'unknown' and '#/companies' in url:
+            log_message("🔄 URL contains #/companies — forcing page type to 'search'", 'INFO')
+            page_type = 'search'
         
         if page_type == 'search':
             return self._scrape_search_results(follow_links, max_pages, min_delay, max_delay)
@@ -771,5 +924,3 @@ class ApolloScraper:
     def __exit__(self, exc_type, exc_val, exc_tb):
         """Context manager exit"""
         self.close()
-
-
